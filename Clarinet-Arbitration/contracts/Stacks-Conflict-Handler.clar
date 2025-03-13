@@ -11,6 +11,8 @@
 (define-constant ERR_TIMEOUT_NOT_REACHED (err u1008))
 (define-constant ERR_INVALID_ARBITER (err u1009))
 (define-constant ERR_TRANSFER_FAILED (err u1010))
+(define-constant ERR_INVALID_PARAMETER (err u1011)) ;; New error for parameter validation
+(define-constant ERR_EVIDENCE_LIMIT (err u1012)) ;; New error for evidence limit
 
 ;; Data variables
 (define-data-var contract-owner principal tx-sender)
@@ -57,6 +59,10 @@
 (define-public (initialize (new-owner principal) (fee uint))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR_NOT_AUTHORIZED)
+    ;; Validate new owner is not null
+    (asserts! (not (is-eq new-owner 'SP000000000000000000002Q6VF78)) ERR_INVALID_PARAMETER)
+    ;; Validate fee is reasonable
+    (asserts! (and (>= fee u10) (<= fee u10000)) ERR_INVALID_PARAMETER)
     (var-set contract-owner new-owner)
     (var-set arbitration-fee fee)
     (ok true)
@@ -77,8 +83,6 @@
       (dispute-id (+ (var-get dispute-counter) u1))
       (required-amount (+ amount (var-get arbitration-fee)))
       (current-block-height block-height)
-      (evidence-deadline (+ current-block-height evidence-period))
-      (resolution-deadline (+ evidence-deadline resolution-period))
     )
     
     ;; Validate inputs
@@ -87,26 +91,41 @@
     (asserts! (not (is-eq tx-sender arbiter)) ERR_INVALID_ARBITER)
     (asserts! (not (is-eq respondent arbiter)) ERR_INVALID_ARBITER)
     
-    ;; Transfer funds to contract
-    (asserts! (is-ok (stx-transfer? required-amount tx-sender (as-contract tx-sender))) ERR_INSUFFICIENT_FUNDS)
+    ;; Validate periods are reasonable
+    (asserts! (and (>= evidence-period u10) (<= evidence-period u10000)) ERR_INVALID_PARAMETER)
+    (asserts! (and (>= resolution-period u10) (<= resolution-period u10000)) ERR_INVALID_PARAMETER)
     
-    ;; Create dispute
-    (map-set disputes dispute-id {
-      claimant: tx-sender,
-      respondent: respondent,
-      arbiter: arbiter,
-      amount: amount,
-      status: STATUS_PENDING,
-      resolution: none,
-      evidence-deadline: evidence-deadline,
-      resolution-deadline: resolution-deadline,
-      description: description
-    })
+    ;; Validate description is not empty
+    (asserts! (> (len description) u0) ERR_INVALID_PARAMETER)
     
-    ;; Increment counter
-    (var-set dispute-counter dispute-id)
-    
-    (ok dispute-id)
+    ;; Calculate deadlines after validation
+    (let
+      (
+        (evidence-deadline (+ current-block-height evidence-period))
+        (resolution-deadline (+ evidence-deadline resolution-period))
+      )
+      
+      ;; Transfer funds to contract
+      (asserts! (is-ok (stx-transfer? required-amount tx-sender (as-contract tx-sender))) ERR_INSUFFICIENT_FUNDS)
+      
+      ;; Create dispute
+      (map-set disputes dispute-id {
+        claimant: tx-sender,
+        respondent: respondent,
+        arbiter: arbiter,
+        amount: amount,
+        status: STATUS_PENDING,
+        resolution: none,
+        evidence-deadline: evidence-deadline,
+        resolution-deadline: resolution-deadline,
+        description: description
+      })
+      
+      ;; Increment counter
+      (var-set dispute-counter dispute-id)
+      
+      (ok dispute-id)
+    )
   )
 )
 
@@ -136,7 +155,6 @@
   (let 
     (
       (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
-      (current-evidence (default-to (list) (map-get? evidence { dispute-id: dispute-id, party: tx-sender })))
     )
     
     ;; Validate caller is a party in the dispute
@@ -151,13 +169,26 @@
     ;; Check deadline
     (asserts! (<= block-height (get evidence-deadline dispute)) ERR_TIMEOUT_NOT_REACHED)
     
-    ;; Store evidence
-    (map-set evidence 
-      { dispute-id: dispute-id, party: tx-sender } 
-      (unwrap! (as-max-len? (append current-evidence evidence-hash) u10) ERR_INVALID_DISPUTE)
-    )
+    ;; Validate evidence hash is not empty
+    (asserts! (> (len evidence-hash) u0) ERR_INVALID_PARAMETER)
     
-    (ok true)
+    ;; Get current evidence safely
+    (let
+      (
+        (current-evidence (default-to (list) (map-get? evidence { dispute-id: dispute-id, party: tx-sender })))
+      )
+      
+      ;; Check if we can add more evidence
+      (asserts! (< (len current-evidence) u10) ERR_EVIDENCE_LIMIT)
+      
+      ;; Store evidence - using as-max-len? to ensure we don't exceed the list limit
+      (map-set evidence 
+        { dispute-id: dispute-id, party: tx-sender } 
+        (unwrap! (as-max-len? (append current-evidence evidence-hash) u10) ERR_EVIDENCE_LIMIT)
+      )
+      
+      (ok true)
+    )
   )
 )
 
@@ -189,10 +220,6 @@
   (let 
     (
       (dispute (unwrap! (map-get? disputes dispute-id) ERR_DISPUTE_NOT_FOUND))
-      (claimant (get claimant dispute))
-      (respondent (get respondent dispute))
-      (amount (get amount dispute))
-      (half-amount (/ amount u2))
     )
     
     ;; Validate caller is arbiter
@@ -215,22 +242,31 @@
     }))
     
     ;; Distribute funds based on resolution
-    (if (is-eq resolution-type RESOLUTION_CLAIMANT_WINS)
-      (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender claimant))) ERR_TRANSFER_FAILED)
-      (if (is-eq resolution-type RESOLUTION_RESPONDENT_WINS)
-        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender respondent))) ERR_TRANSFER_FAILED)
-        ;; Split case - Fix for the error
-        (begin
-          (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender claimant))) ERR_TRANSFER_FAILED)
-          (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender respondent))) ERR_TRANSFER_FAILED)
+    (let
+      (
+        (claimant (get claimant dispute))
+        (respondent (get respondent dispute))
+        (amount (get amount dispute))
+        (half-amount (/ amount u2))
+      )
+      
+      (if (is-eq resolution-type RESOLUTION_CLAIMANT_WINS)
+        (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender claimant))) ERR_TRANSFER_FAILED)
+        (if (is-eq resolution-type RESOLUTION_RESPONDENT_WINS)
+          (asserts! (is-ok (as-contract (stx-transfer? amount tx-sender respondent))) ERR_TRANSFER_FAILED)
+          ;; Split case
+          (begin
+            (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender claimant))) ERR_TRANSFER_FAILED)
+            (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender respondent))) ERR_TRANSFER_FAILED)
+          )
         )
       )
+      
+      ;; Return arbitration fees to arbiter
+      (asserts! (is-ok (as-contract (stx-transfer? (* (var-get arbitration-fee) u2) tx-sender (get arbiter dispute)))) ERR_TRANSFER_FAILED)
+      
+      (ok true)
     )
-    
-    ;; Return arbitration fees to arbiter
-    (asserts! (is-ok (as-contract (stx-transfer? (* (var-get arbitration-fee) u2) tx-sender (get arbiter dispute)))) ERR_TRANSFER_FAILED)
-    
-    (ok true)
   )
 )
 
@@ -283,10 +319,9 @@
         (half-amount (/ amount u2))
         (claimant (get claimant dispute))
         (respondent (get respondent dispute))
-        (arbiter (get arbiter dispute))
       )
       
-      ;; Split funds between parties - Fix for the error
+      ;; Split funds between parties
       (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender claimant))) ERR_TRANSFER_FAILED)
       (asserts! (is-ok (as-contract (stx-transfer? half-amount tx-sender respondent))) ERR_TRANSFER_FAILED)
       
